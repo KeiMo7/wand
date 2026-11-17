@@ -12,6 +12,7 @@ error happened)::
 """
 import ctypes
 import functools
+import logging
 import numbers
 import os
 import weakref
@@ -30,9 +31,13 @@ from .exceptions import (MissingDelegateError, WandException,
                          WandLibraryVersionError, WandRuntimeError)
 from .font import Font
 from .resource import DestroyedResourceError, Resource, genesis
-from .version import MAGICK_HDRI, MAGICK_VERSION_NUMBER
+from .version import (MAGICK_HDRI, MAGICK_VERSION_NUMBER, QUANTUM_DEPTH,
+                      QUANTUM_RANGE)
+
+LOGGER = logging.getLogger(__name__)
 
 __all__ = ('ALPHA_CHANNEL_TYPES', 'AUTO_THRESHOLD_METHODS', 'CHANNELS',
+           'BIT_DEPTH_LIMITED_FORMATS',
            'COLORSPACE_TYPES', 'COMPARE_METRICS', 'COMPOSITE_OPERATORS',
            'COMPRESSION_TYPES', 'DISPOSE_TYPES', 'DISTORTION_METHODS',
            'DITHER_METHODS', 'EVALUATE_OPS', 'FILTER_TYPES', 'FUNCTION_TYPES',
@@ -505,6 +510,17 @@ DISTORTION_METHODS = (
 #:
 #: .. versionadded:: 0.5.0
 DITHER_METHODS = ('undefined', 'no', 'riemersma', 'floyd_steinberg')
+
+
+#: (:class:`frozenset`) Image formats that can only store 8-bit samples.
+#: Used by :meth:`Image.save` to reject explicit high bit-depth output
+#: requests instead of silently truncating them to 8-bit.
+#:
+#: .. versionadded:: 0.7.3
+BIT_DEPTH_LIMITED_FORMATS = frozenset([
+    'BMP', 'BMP2', 'BMP3', 'GIF', 'GIF87', 'JPEG', 'JPG', 'PJPEG',
+    'PNG8', 'PNG24', 'PNG32', 'WEBP',
+])
 
 
 #: (:class:`tuple`) The list of evaluation operators. Used by
@@ -1745,6 +1761,100 @@ class BaseImage(Resource):
         r = library.MagickSetImageDepth(self.wand, depth)
         if not r:  # pragma: no cover
             raise self.raise_exception()
+
+    @manipulative
+    def convert_depth(self, depth, dither='no'):
+        """Explicitly converts the image to the given bit ``depth``.
+
+        Unlike assigning :attr:`depth` directly, this method validates the
+        request against the library quantum depth, applies an optional
+        ``dither`` strategy when reducing depth, and logs the decision so
+        high bit-depth pipelines (e.g. 10-bit) can trace where the depth
+        changes. Scaling up (8-bit to 10-bit, for example) never truncates
+        sample values; the intermediate buffer always matches the target
+        depth.
+
+        :param depth: target bits per color sample, between ``1`` and
+                      the quantum depth of the ImageMagick build
+        :type depth: :class:`numbers.Integral`
+        :param dither: dither method applied when reducing depth.
+                       See :const:`DITHER_METHODS`. Defaults to ``'no'``
+        :type dither: :class:`str`
+
+        .. versionadded:: 0.7.3
+        """
+        assertions.assert_counting_number(depth=depth)
+        assertions.string_in_list(DITHER_METHODS,
+                                  'wand.image.DITHER_METHODS',
+                                  dither=dither)
+        if depth > QUANTUM_DEPTH:
+            raise ValueError('depth can not exceed the quantum depth of '
+                             'this ImageMagick build: ' + repr(QUANTUM_DEPTH))
+        source_depth = self.depth
+        LOGGER.debug('convert_depth: entering with depth=%r, dither=%r '
+                     '(source depth=%r)', depth, dither, source_depth)
+        try:
+            if dither != 'no' and depth < source_depth:
+                self.posterize(1 << depth, dither)
+            self.depth = depth
+        except Exception:
+            LOGGER.error('convert_depth: failed to convert depth from %r '
+                         'to %r', source_depth, depth)
+            raise
+        LOGGER.info('convert_depth: depth decision %r -> %r (dither=%r)',
+                    source_depth, depth, dither)
+        LOGGER.debug('convert_depth: leaving with depth=%r', self.depth)
+
+    def validate_depth(self, expected=None):
+        """Detects mismatches between the declared bit depth and the
+        actual sample values of the image.
+
+        Every sample is checked for exact representability at the declared
+        depth, so values exceeding the declared range (for example 10-bit
+        samples in a buffer declared as 8-bit) are reported instead of
+        being silently truncated.
+
+        :param expected: declared bits per color sample. When omitted, the
+                         bit depth recorded in the image metadata (if any)
+                         is used
+        :type expected: :class:`numbers.Integral`
+        :returns: the declared depth, once proven consistent with the
+                  samples
+        :rtype: :class:`numbers.Integral`
+        :raises WandRuntimeError: when the samples exceed the declared depth
+
+        .. versionadded:: 0.7.3
+        """
+        declared = expected
+        if declared is None:
+            declared_str = self.metadata.get('png:IHDR.bit-depth-orig')
+            if declared_str is not None:
+                try:
+                    declared = int(declared_str)
+                except ValueError:
+                    declared = None
+        if declared is None:
+            LOGGER.debug('validate_depth: no declared depth; depth=%r',
+                         self.depth)
+            return self.depth
+        assertions.assert_counting_number(depth=declared)
+        if declared >= QUANTUM_DEPTH:
+            return declared
+        modulus = (1 << declared) - 1
+        representable = set(
+            (q * QUANTUM_RANGE + modulus // 2) // modulus
+            for q in range(modulus + 1)
+        )
+        samples = self.export_pixels(channel_map='RGB', storage='quantum')
+        if not set(samples) <= representable:
+            msg = ('declared depth {0!r} does not match image samples '
+                   '(found values outside the {0!r}-bit range)'
+                   .format(declared))
+            LOGGER.error('validate_depth: %s', msg)
+            raise WandRuntimeError(msg)
+        LOGGER.debug('validate_depth: samples consistent with declared '
+                     'depth %r', declared)
+        return declared
 
     @property
     def dispose(self):
@@ -10521,7 +10631,8 @@ class Image(BaseImage):
                 instance.destroy()
         self.sequence.instances = []
 
-    def save(self, file=None, filename=None, adjoin=True):
+    def save(self, file=None, filename=None, adjoin=True, depth=None,
+             dither='no'):
         """Saves the image into the ``file`` or ``filename``. It takes
         only one argument at a time.
 
@@ -10532,6 +10643,14 @@ class Image(BaseImage):
         :param adjoin: write all images to a single multi-image file. Only
                        available if file format supports frames, layers, & etc.
         :type adjoin: :class:`bool`
+        :param depth: explicit bits per color sample for the output, or
+                      ``'auto'`` to keep each image's own depth. When
+                      omitted the existing behavior is preserved
+        :type depth: :class:`numbers.Integral` or :class:`str`
+        :param dither: dither method applied when ``depth`` reduces the
+                       bit depth. See :const:`DITHER_METHODS`. Defaults
+                       to ``'no'``
+        :type dither: :class:`str`
 
         .. versionadded:: 0.1.1
 
@@ -10541,7 +10660,17 @@ class Image(BaseImage):
         .. versionchanged:: 6.0.0
            The ``adjoin`` parameter was added.
 
+        .. versionchanged:: 0.7.3
+           The ``depth`` & ``dither`` parameters were added.
+
         """
+        if depth is None:
+            if dither != 'no':
+                raise ValueError('dither requires an explicit depth')
+        else:
+            self._save_with_depth(file=file, filename=filename,
+                                  adjoin=adjoin, depth=depth, dither=dither)
+            return
         if file is None and filename is None:
             raise TypeError('expected an argument')
         elif file is not None and filename is not None:
@@ -10582,6 +10711,60 @@ class Image(BaseImage):
                 r = library.MagickWriteImage(self.wand, filename)
             if not r:
                 self.raise_exception()
+
+    def _save_with_depth(self, file=None, filename=None, adjoin=True,
+                         depth=None, dither='no'):
+        """Explicit bit-depth output path for :meth:`save`. The image is
+        staged on a clone so the instance is never mutated, and partial
+        output is removed if the write fails.
+        """
+        if isinstance(depth, str):
+            if depth != 'auto':
+                raise ValueError('depth must be an integer or \'auto\', '
+                                 'not ' + repr(depth))
+            target_depth = self.depth
+        else:
+            assertions.assert_counting_number(depth=depth)
+            target_depth = depth
+        format_name = ''
+        if filename is not None:
+            if isinstance(filename, str):
+                base = filename
+            elif hasattr(filename, '__fspath__'):
+                base = os.fspath(filename)
+            else:
+                base = ''
+            format_name = os.path.splitext(base)[1].lstrip('.').upper()
+        if not format_name:
+            format_name = (self.format or '').upper()
+        if target_depth > 8 and format_name in BIT_DEPTH_LIMITED_FORMATS:
+            msg = ('format {0!r} can not store {1!r}-bit samples; use a '
+                   'high bit-depth format such as PNG or TIFF, or lower '
+                   'the depth to 8'.format(format_name, target_depth))
+            LOGGER.error('save: %s', msg)
+            raise ValueError(msg)
+        LOGGER.info('save: depth decision target=%r format=%r',
+                    target_depth, format_name or None)
+        LOGGER.debug('save: entering explicit depth path')
+        staging = self.clone()
+        preexisting = filename is not None and os.path.exists(filename)
+        try:
+            staging.convert_depth(target_depth, dither=dither)
+            staging.save(file=file, filename=filename, adjoin=adjoin)
+        except Exception:
+            if (filename is not None and not preexisting and
+                    os.path.exists(filename)):
+                try:
+                    os.remove(filename)
+                except OSError:  # pragma: no cover
+                    LOGGER.error('save: unable to remove partial output '
+                                 '%r', filename)
+            LOGGER.error('save: explicit depth path failed for %r',
+                         filename if filename is not None else file)
+            raise
+        finally:
+            staging.destroy()
+        LOGGER.debug('save: leaving explicit depth path')
 
 
 class Iterator(Resource, abc.Iterator):

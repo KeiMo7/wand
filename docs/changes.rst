@@ -14,6 +14,11 @@ Version 0.7.3
 
 Unreleased.
 
+ - Added explicit bit-depth output path: ``depth`` & ``dither`` parameters on
+   :meth:`Image.save() <wand.image.Image.save>`,
+   :meth:`Image.convert_depth() <wand.image.BaseImage.convert_depth>`,
+   :meth:`Image.validate_depth() <wand.image.BaseImage.validate_depth>`,
+   and :const:`BIT_DEPTH_LIMITED_FORMATS <wand.image.BIT_DEPTH_LIMITED_FORMATS>`.
  - [TEST] Removed deprecated :meth:`itertools.product` calls in unit tests.
  - [TEST] Rewrote assertion methods for :meth:`Image.clear() <wand.image.Image.clear>` unit test. [:issue:`691`]
 
@@ -1413,4 +1418,3 @@ Version 0.1.0
 -------------
 
 Released on October 1, 2011. Very alpha version.
-

@@ -108,3 +108,54 @@ can be simpler::
 
     with Image(filename='pikachu.png') as img:
         jpeg_bin = img.make_blob('jpeg')
+
+
+Controlling output bit depth
+----------------------------
+
+.. versionadded:: 0.7.3
+
+By default :meth:`~wand.image.Image.save` keeps its historical behavior and
+writes whatever depth the image currently holds. High bit-depth pipelines
+(for example 10-bit delivery) can instead request an explicit output depth
+with the ``depth`` parameter. The image itself is never mutated; the depth
+conversion is applied to an internal staging copy::
+
+    from wand.image import Image
+
+    with Image(filename='frame10.png') as img:
+        img.save(filename='frame10-out.png', depth=10)
+
+Passing ``depth='auto'`` keeps each image's own depth, which makes mixed
+batches decide per item instead of falling back to the lowest depth::
+
+    import os
+
+    for name in os.listdir('mixed-dir'):
+        with Image(filename=os.path.join('mixed-dir', name)) as img:
+            img.save(filename=os.path.join('out-dir', name), depth='auto')
+
+When reducing depth, a dither strategy can be selected with the ``dither``
+parameter (see :const:`~wand.image.DITHER_METHODS`)::
+
+    with Image(filename='frame10.png') as img:
+        img.save(filename='frame8.png', depth=8, dither='floyd_steinberg')
+
+Formats that can only store 8-bit samples (see
+:const:`~wand.image.BIT_DEPTH_LIMITED_FORMATS`) reject an explicit high
+bit-depth request with a :exc:`ValueError` instead of silently truncating
+to 8-bit.
+
+Use :meth:`~wand.image.Image.convert_depth` for in-place depth conversion,
+and :meth:`~wand.image.Image.validate_depth` to detect inputs whose
+declared depth does not match their actual sample values.
+
+Migrating an existing 8-bit pipeline only requires adding the parameter
+where high bit-depth output is needed; omitting it keeps the previous
+behavior, return values, and exception types unchanged::
+
+    # before: everything was written as-is (8-bit chain)
+    img.save(filename='out.png')
+
+    # after: explicit 10-bit output, same call site
+    img.save(filename='out.png', depth=10)
